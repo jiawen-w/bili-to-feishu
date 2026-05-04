@@ -1,38 +1,33 @@
 """
-B 站视频 → 音频 → 文字 → AI 重构 → 飞书知识库文章
+B 站 / YouTube 视频 → 音频 → 文字 → AI 重构 → 飞书知识库文章
 一键流程：输入链接，自动完成所有步骤
 
 依赖安装:
-    pip install -r requirements.txt
+    pip install yt-dlp faster-whisper anthropic
     brew install ffmpeg
     npm install -g @larksuite/cli
 
-配置:
-    复制 .env.example 为 .env，填入你的 API Key 和路径
-
 飞书首次登录:
-    lark-cli config init --new
-    lark-cli auth login --recommend
+    /Users/chenjiawen/.hermes/node/bin/lark-cli config init --new
+    /Users/chenjiawen/.hermes/node/bin/lark-cli auth login --recommend
 """
 
 import os
 import re
 import sys
 import subprocess
-from dotenv import load_dotenv
 
-load_dotenv()
 
-# ── AI / 飞书配置（从 .env 读取）──────────────────────────────────────────────
+# ── AI / 飞书配置 ──────────────────────────────────────────────────────────────
 
-AI_BASE_URL = os.getenv("AI_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding")
-AI_API_KEY  = os.getenv("AI_API_KEY", "")
-AI_MODEL    = os.getenv("AI_MODEL", "doubao-seed-2.0-pro")
-LARK_CLI    = os.getenv("LARK_CLI", "lark-cli")
-BILI_BROWSER = os.getenv("BILI_BROWSER", "chrome")
+AI_BASE_URL  = "https://ark.cn-beijing.volces.com/api/coding"
+AI_API_KEY   = "1d3ace95-c577-4eee-ae9d-4fc85f3d07ee"
+AI_MODEL     = "doubao-seed-2.0-pro"
+LARK_CLI     = "/Users/chenjiawen/.hermes/node/bin/lark-cli"
+BILI_BROWSER = "chrome"   # B 站下载用的浏览器 Cookie：chrome 或 safari
 
 PROMPT_TEMPLATE = """\
-你是专业技术文档/知识库编撰工程师，我给你B站视频完整字幕，请把它重构为**标准化精品技术知识库教程**。
+你是专业技术文档/知识库编撰工程师，我给你一段视频的完整字幕，请把它重构为**标准化精品技术知识库教程**。
 
 输出结构：
 1. 教程名称
@@ -63,15 +58,50 @@ PROMPT_TEMPLATE = """\
 
 # ── 工具函数 ───────────────────────────────────────────────────────────────────
 
+def detect_platform(url: str) -> str:
+    """识别平台：bilibili / youtube / unknown"""
+    if "bilibili.com" in url or url.startswith("BV"):
+        return "bilibili"
+    if "youtube.com" in url or "youtu.be" in url:
+        return "youtube"
+    return "unknown"
+
+
 def clean_url(url: str) -> str:
-    if url.startswith("bilibili.com"):
-        url = "https://www." + url
-    elif url.startswith("www.bilibili.com"):
-        url = "https://" + url
-    match = re.search(r"BV\w+", url)
-    if match:
-        return f"https://www.bilibili.com/video/{match.group(0)}/"
+    """标准化 URL"""
+    url = url.strip()
+    platform = detect_platform(url)
+
+    if platform == "bilibili":
+        if url.startswith("bilibili.com"):
+            url = "https://www." + url
+        elif url.startswith("www.bilibili.com"):
+            url = "https://" + url
+        match = re.search(r"BV\w+", url)
+        if match:
+            return f"https://www.bilibili.com/video/{match.group(0)}/"
+
+    if platform == "youtube":
+        # 短链转完整链
+        match = re.search(r"youtu\.be/([^?&]+)", url)
+        if match:
+            return f"https://www.youtube.com/watch?v={match.group(1)}"
+
     return url
+
+
+def build_ydl_opts(url: str, output_dir: str) -> dict:
+    """根据平台返回对应的 yt-dlp 参数"""
+    base = {
+        "quiet": False,
+        "format": "bestaudio/best",
+        "outtmpl": os.path.join(output_dir, "%(title)s.%(ext)s"),
+        "noplaylist": True,
+        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3"}],
+    }
+    if detect_platform(url) == "bilibili":
+        base["cookiesfrombrowser"] = (BILI_BROWSER,)
+    return base
 
 
 def format_timestamp(seconds: float) -> str:
@@ -91,20 +121,15 @@ def ensure_package(package: str, import_name: str | None = None) -> None:
         subprocess.check_call([sys.executable, "-m", "pip", "install", package])
 
 
-# ── B 站下载公共配置（带浏览器 Cookie，避免 403）──────────────────────────────
-
-BILI_YDL_BASE = {
-    "quiet": True,
-    "cookiesfrombrowser": (BILI_BROWSER,),  # 从 .env 读取，默认 chrome
-}
-
-
 # ── Step 1: 获取视频标题 ────────────────────────────────────────────────────────
 
 def get_title(url: str) -> str:
     ensure_package("yt_dlp", "yt_dlp")
     import yt_dlp
-    with yt_dlp.YoutubeDL(BILI_YDL_BASE) as ydl:
+    opts = {"quiet": True}
+    if detect_platform(url) == "bilibili":
+        opts["cookiesfrombrowser"] = (BILI_BROWSER,)
+    with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
         return info.get("title", "未命名视频")
 
@@ -117,16 +142,7 @@ def download_audio(url: str, output_dir: str) -> str:
 
     os.makedirs(output_dir, exist_ok=True)
 
-    ydl_opts = {
-        **BILI_YDL_BASE,
-        "quiet": False,
-        "format": "bestaudio/best",
-        "outtmpl": os.path.join(output_dir, "%(title)s.%(ext)s"),
-        "noplaylist": True,
-        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3"}],
-    }
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    with yt_dlp.YoutubeDL(build_ydl_opts(url, output_dir)) as ydl:
         info = ydl.extract_info(url)
         title = info.get("title", "audio")
         audio_path = os.path.join(output_dir, f"{title}.mp3")
@@ -144,7 +160,7 @@ def download_audio(url: str, output_dir: str) -> str:
 
 # ── Step 3: 音频转文字 ──────────────────────────────────────────────────────────
 
-def transcribe(audio_path: str, model_size: str = "medium", language: str = "zh") -> tuple[str, list]:
+def transcribe(audio_path: str, model_size: str = "medium", language: str | None = None) -> tuple[str, list]:
     ensure_package("faster-whisper", "faster_whisper")
     from faster_whisper import WhisperModel
 
@@ -176,11 +192,7 @@ def ai_restructure(title: str, url: str, transcript: str) -> str:
     import anthropic
 
     print("\nAI 重构中，请稍候 …")
-    client = anthropic.Anthropic(
-        api_key=AI_API_KEY,
-        base_url=AI_BASE_URL,
-    )
-
+    client = anthropic.Anthropic(api_key=AI_API_KEY, base_url=AI_BASE_URL)
     prompt = PROMPT_TEMPLATE.format(title=title, url=url, transcript=transcript)
 
     message = client.messages.create(
@@ -215,7 +227,7 @@ def run(
     url: str,
     work_dir: str = "~/Downloads/bili_to_feishu",
     model_size: str = "medium",
-    language: str = "zh",
+    language: str | None = None,   # None = 自动检测，"zh" 中文，"en" 英文
     keep_audio: bool = True,
     save_subtitle: bool = True,
     upload_feishu: bool = True,
@@ -223,21 +235,21 @@ def run(
     work_dir = os.path.expanduser(work_dir)
     os.makedirs(work_dir, exist_ok=True)
 
+    url = clean_url(url)
+    platform = detect_platform(url)
+
     print("=" * 50)
+    print(f"平台：{'B 站' if platform == 'bilibili' else 'YouTube' if platform == 'youtube' else '未知'}")
     print(f"链接：{url}")
     print("=" * 50)
 
-    # Step 1
     print("\n[1/5] 获取视频信息 …")
-    url = clean_url(url)
     title = get_title(url)
     print(f"✓ 标题：{title}")
 
-    # Step 2
     print("\n[2/5] 下载音频 …")
     audio_path = download_audio(url, work_dir)
 
-    # Step 3
     print("\n[3/5] 音频转文字 …")
     full_text, segment_list = transcribe(audio_path, model_size=model_size, language=language)
 
@@ -250,7 +262,6 @@ def run(
         f.write(full_text)
     print(f"✓ 原始文本已保存：{base}.txt")
 
-    # Step 4
     print("\n[4/5] AI 重构为知识库文章 …")
     article = ai_restructure(title=title, url=url, transcript=full_text)
 
@@ -258,7 +269,6 @@ def run(
         f.write(article)
     print(f"✓ 知识库文章已保存：{base}_知识库.md")
 
-    # Step 5
     if upload_feishu:
         print("\n[5/5] 写入飞书 …")
         upload_to_feishu(title=f"【知识库】{title}", content=article)
@@ -312,15 +322,14 @@ def run_from_txt(
 # ── 入口 ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # ── 模式选择 ──
     # 模式 A：完整流程（下载 → 转录 → AI → 飞书）
     # 模式 B：从已有 txt 直接跑 AI + 飞书（跳过下载和转录）
-    MODE = "B"  # 改为 "A" 切换到完整流程
+    MODE = "A"
 
-    if MODE == "A":
+    if MODE == "B":
         run_from_txt(
             txt_path="~/Downloads/bili_to_feishu/我蒸馏了17个大佬给我打工（开源免费）.txt",
-            title="我蒸馏了17个大佬给我打工（开源免费）",   # 可留空，自动用文件名
+            title="我蒸馏了17个大佬给我打工（开源免费）",
             url="https://www.bilibili.com/video/BV1BXQABNE4y/",
             upload_feishu=True,
         )
@@ -328,16 +337,14 @@ if __name__ == "__main__":
         if len(sys.argv) > 1:
             video_url = sys.argv[1]
         else:
-            video_url = input("请输入 B 站视频链接：").strip()
+            video_url = input("请输入视频链接（B 站 / YouTube）：").strip()
 
         run(
             url=video_url,
             work_dir="~/Downloads/bili_to_feishu",
-            model_size="medium",   # Whisper 模型：tiny / small / medium / large
-            language="zh",         # zh / en / None（自动检测）
-            keep_audio=True,       # 是否保留音频
-            save_subtitle=True,    # 是否保存 .srt 字幕
-            upload_feishu=True,    # 是否写入飞书
+            model_size="medium",     # Whisper 模型：tiny / small / medium / large
+            language=None,           # None=自动检测  "zh"=中文  "en"=英文
+            keep_audio=True,
+            save_subtitle=True,
+            upload_feishu=True,
         )
-
-
