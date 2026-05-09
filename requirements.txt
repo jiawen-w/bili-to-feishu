@@ -1,0 +1,9 @@
+yt-dlp
+faster-whisper
+anthropic
+requests
+python-dotenv
+beautifulsoup4
+markdownify
+browser-cookie3
+playwright

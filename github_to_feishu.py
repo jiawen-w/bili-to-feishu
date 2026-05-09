@@ -3,10 +3,7 @@ GitHub 仓库 → AI 重构 → 飞书知识库文章
 输入一个 GitHub 仓库/目录链接，自动抓取代码和文档，生成知识库教程上传飞书
 
 依赖安装:
-    pip install -r requirements.txt
-
-配置:
-    复制 .env.example 为 .env，填入你的 API Key 和路径
+    pip install requests anthropic
 """
 
 import os
@@ -14,16 +11,15 @@ import re
 import sys
 import subprocess
 import requests
-from dotenv import load_dotenv
 
-load_dotenv()
 
-# ── 配置（从 .env 读取）──────────────────────────────────────────────────────
+# ── 配置（与 bili_to_feishu.py 相同）─────────────────────────────────────────
 
-AI_BASE_URL = os.getenv("AI_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding")
-AI_API_KEY  = os.getenv("AI_API_KEY", "")
-AI_MODEL    = os.getenv("AI_MODEL", "doubao-seed-2.0-pro")
-LARK_CLI    = os.getenv("LARK_CLI", "lark-cli")
+AI_BASE_URL = "https://ark.cn-beijing.volces.com/api/coding"
+AI_API_KEY  = "1d3ace95-c577-4eee-ae9d-4fc85f3d07ee"
+AI_MODEL    = "doubao-seed-2.0-pro"
+
+LARK_CLI    = "/Users/chenjiawen/.hermes/node/bin/lark-cli"
 
 # 抓取这些扩展名的文件
 INCLUDE_EXTS = {".md", ".py", ".js", ".ts", ".json", ".yaml", ".yml", ".toml", ".txt", ".sh"}

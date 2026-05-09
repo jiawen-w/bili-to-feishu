@@ -11,7 +11,8 @@
 
 | 脚本 | 功能 |
 |---|---|
-| `bili_to_feishu.py` | B站视频 → 音频 → 文字 → AI重构 → 飞书（主流程）|
+| `bili_to_feishu.py` | B站/YouTube视频 → 音频 → 文字 → AI重构 → 飞书（主流程）|
+| `web_to_feishu.py` | 网页文章（CSDN/知乎/掘金/微信公众号等）→ 飞书 |
 | `github_to_feishu.py` | GitHub仓库 → AI重构 → 飞书 |
 | `bilibili_downloader.py` | 单独下载 B 站视频/音频/字幕 |
 | `audio_to_text.py` | 单独将音频转为文字/字幕 |
@@ -37,6 +38,7 @@ cd bili-to-feishu
 **2. 安装 Python 依赖**
 ```bash
 pip install -r requirements.txt
+playwright install chromium   # 微信公众号抓取需要
 ```
 
 **3. 安装 ffmpeg**
@@ -86,6 +88,20 @@ python bili_to_feishu.py "https://www.bilibili.com/video/BV1xxxxx"
 - `视频标题.txt` — 原始文字
 - `视频标题_知识库.md` — AI 重构后的教程
 - 飞书文档（自动创建）
+
+### 网页文章 → 飞书知识库
+
+支持 CSDN、知乎、掘金、博客园、微信公众号等平台，自动处理图片：
+
+```bash
+python web_to_feishu.py "https://blog.csdn.net/xxx/article/details/xxx"
+python web_to_feishu.py "https://mp.weixin.qq.com/s/xxx"
+python web_to_feishu.py "https://juejin.cn/post/xxx"
+```
+
+- 公开平台（CSDN/掘金/微信）：图片保留原始链接，飞书直接渲染
+- 需登录平台（知乎）：自动读取 Chrome Cookie
+- 微信公众号：自动启动无头浏览器渲染，触发懒加载图片
 
 ### GitHub 仓库 → 飞书知识库
 
