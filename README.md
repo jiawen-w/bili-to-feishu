@@ -1,28 +1,30 @@
-# bili-to-feishu
+# any2feishu
 
-> B 站视频 / GitHub 项目 → AI 一键生成知识库文章 → 飞书文档
+> 视频 / 网页 / GitHub → AI 一键生成知识库文章 → 飞书
 
-输入一个 B 站链接，自动完成：下载音频 → Whisper 转文字 → AI 重构为知识库教程 → 写入飞书。  
-也支持把 GitHub 仓库直接转成飞书知识库文章。
+把任意内容源转化为飞书知识库文章：
+- **B 站 / YouTube 视频** — 下载音频 → Whisper 转文字 → AI 重构 → 飞书
+- **网页文章** — 抓取正文+图片（CSDN / 知乎 / 掘金 / 微信公众号）→ 飞书
+- **GitHub 仓库** — 抓取源码+文档 → AI 重构为教程 → 飞书
 
 ---
 
-## 功能
+## 功能一览
 
-| 脚本 | 功能 |
-|---|---|
-| `bili_to_feishu.py` | B站/YouTube视频 → 音频 → 文字 → AI重构 → 飞书（主流程）|
-| `web_to_feishu.py` | 网页文章（CSDN/知乎/掘金/微信公众号等）→ 飞书 |
-| `github_to_feishu.py` | GitHub仓库 → AI重构 → 飞书 |
-| `bilibili_downloader.py` | 单独下载 B 站视频/音频/字幕 |
-| `audio_to_text.py` | 单独将音频转为文字/字幕 |
+| 脚本 | 输入 | 输出 |
+|---|---|---|
+| `bili_to_feishu.py` | B 站 / YouTube 视频链接 | 字幕 + AI 知识库文章 + 飞书文档 |
+| `web_to_feishu.py` | 网页链接（CSDN/知乎/掘金/微信等）| 保留图片的飞书文档 |
+| `github_to_feishu.py` | GitHub 仓库/目录链接 | AI 重构教程 + 飞书文档 |
+| `bilibili_downloader.py` | B 站链接 | 视频 / 音频 / 字幕文件 |
+| `audio_to_text.py` | 本地音频文件 | 文字稿 / SRT 字幕 |
 
 ---
 
 ## 环境要求
 
 - Python 3.10+
-- ffmpeg（音频提取）
+- ffmpeg（音频提取，`bili_to_feishu.py` 需要）
 - Node.js + lark-cli（飞书写入）
 
 ---
@@ -31,7 +33,7 @@
 
 **1. 克隆项目**
 ```bash
-git clone https://github.com/你的用户名/bili-to-feishu.git
+git clone https://github.com/jiawen-w/bili-to-feishu.git
 cd bili-to-feishu
 ```
 
@@ -41,7 +43,7 @@ pip install -r requirements.txt
 playwright install chromium   # 微信公众号抓取需要
 ```
 
-**3. 安装 ffmpeg**
+**3. 安装 ffmpeg**（视频/音频功能需要）
 ```bash
 brew install ffmpeg   # macOS
 ```
@@ -60,7 +62,7 @@ cp .env.example .env
 编辑 `.env`，填入你的配置：
 ```ini
 AI_BASE_URL=https://ark.cn-beijing.volces.com/api/coding
-AI_API_KEY=你的API Key
+AI_API_KEY=你的 API Key
 AI_MODEL=doubao-seed-2.0-pro
 LARK_CLI=/usr/local/bin/lark-cli   # which lark-cli 查看路径
 BILI_BROWSER=chrome                 # 或 safari
@@ -68,18 +70,13 @@ BILI_BROWSER=chrome                 # 或 safari
 
 ---
 
-## 使用
+## 使用方法
 
-### B 站视频 → 飞书知识库
+### B 站 / YouTube 视频 → 飞书知识库
 
-```bash
-python bili_to_feishu.py
-# 输入 B 站链接，回车即可
-```
-
-或直接传链接：
 ```bash
 python bili_to_feishu.py "https://www.bilibili.com/video/BV1xxxxx"
+python bili_to_feishu.py "https://www.youtube.com/watch?v=xxxxx"
 ```
 
 **输出文件**（保存在 `~/Downloads/bili_to_feishu/`）：
@@ -87,39 +84,37 @@ python bili_to_feishu.py "https://www.bilibili.com/video/BV1xxxxx"
 - `视频标题.srt` — 字幕
 - `视频标题.txt` — 原始文字
 - `视频标题_知识库.md` — AI 重构后的教程
-- 飞书文档（自动创建）
+- 飞书文档（自动创建并返回链接）
+
+> 跳过转录：编辑脚本底部将 `MODE = "A"` 改为 `MODE = "B"`，填入已有 `.txt` 路径直接跑 AI 步骤。
 
 ### 网页文章 → 飞书知识库
-
-支持 CSDN、知乎、掘金、博客园、微信公众号等平台，自动处理图片：
 
 ```bash
 python web_to_feishu.py "https://blog.csdn.net/xxx/article/details/xxx"
 python web_to_feishu.py "https://mp.weixin.qq.com/s/xxx"
 python web_to_feishu.py "https://juejin.cn/post/xxx"
+python web_to_feishu.py "https://zhuanlan.zhihu.com/p/xxx"
 ```
 
-- 公开平台（CSDN/掘金/微信）：图片保留原始链接，飞书直接渲染
-- 需登录平台（知乎）：自动读取 Chrome Cookie
-- 微信公众号：自动启动无头浏览器渲染，触发懒加载图片
+| 平台 | 图片处理 | 登录 |
+|---|---|---|
+| CSDN / 掘金 / 博客园 | 保留原始链接 | 无需 |
+| 微信公众号 | 保留原始链接 + Playwright 渲染 | 无需 |
+| 知乎 | 本地下载 | 自动读取 Chrome Cookie |
 
 ### GitHub 仓库 → 飞书知识库
 
 ```bash
+python github_to_feishu.py "https://github.com/owner/repo"
 python github_to_feishu.py "https://github.com/owner/repo/tree/main/path"
 ```
 
 ---
 
-## 跳过转录，直接用已有 txt 重新生成
-
-编辑 `bili_to_feishu.py` 底部，将 `MODE = "A"` 改为 `MODE = "B"`，填入 txt 路径，再运行即可。
-
----
-
 ## AI 模型支持
 
-默认使用火山引擎 doubao-seed-2.0-pro，兼容任意 Anthropic API 格式的服务，修改 `.env` 中的配置即可切换。
+默认使用**火山引擎 doubao-seed-2.0-pro**，兼容任意 Anthropic API 格式的服务（OpenRouter、Claude 官方等），修改 `.env` 中的 `AI_BASE_URL` / `AI_MODEL` 即可切换。
 
 ---
 
