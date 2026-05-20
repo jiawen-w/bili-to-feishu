@@ -347,56 +347,120 @@ def upload_to_wiki(title: str, content: str) -> str:
     return wiki_url
 
 
-# ── 今日日报 ──────────────────────────────────────────────────────────────────
+# ── 今日日报（AI 生成中文版）────────────────────────────────────────────────
+
+DIGEST_PROMPT = """\
+你是 AI 技术资讯编辑，请根据以下 GitHub Trending 数据，用**中文**撰写今日 AI 技术趋势日报。
+
+要求：
+1. 整体总览：1-2 句话概括今日 AI 趋势亮点
+2. 每个新仓库写 3-4 句完整中文介绍（翻译并扩展英文描述，说明用途、亮点、适用场景）
+3. 标注编程语言、今日新增 Star 数、仓库链接
+4. 如有已生成知识库文章的仓库，列出并附链接
+5. 历史已收录的仓库只需简单列表，不展开
+6. Markdown 格式，标题层级清晰，适合直接收藏阅读
+
+日期：{date}
+来源：https://github.com/trending
+
+今日新上榜 AI 仓库（共 {new_count} 个）：
+{new_repos_info}
+
+已生成知识库文章（共 {processed_count} 个）：
+{processed_info}
+
+历史已收录（今日跳过，共 {skipped_count} 个）：
+{skipped_info}
+"""
+
 
 def build_digest(
-    date_str:    str,
-    all_ai:      list[dict],
-    new_repos:   list[dict],
-    processed:   list[dict],
+    date_str:  str,
+    all_ai:    list[dict],
+    new_repos: list[dict],
+    processed: list[dict],
 ) -> str:
+    """调用 AI 生成中文日报，失败则降级为静态模板"""
+    skipped = [r for r in all_ai if r["full_name"] not in {x["full_name"] for x in new_repos}]
+
+    # 组装仓库信息（完整描述，不截断）
+    def repo_block(r: dict) -> str:
+        return (
+            f"- **{r['full_name']}** ({r['language'] or '未知语言'})  "
+            f"今日 ⭐ {r['stars_today'] or '?'}\n"
+            f"  GitHub：{r['url']}\n"
+            f"  原始描述：{r['description'] or '（无描述）'}"
+        )
+
+    new_repos_info  = "\n".join(repo_block(r) for r in new_repos) or "（无）"
+    processed_info  = "\n".join(
+        f"- {r['full_name']}  知识库：{r.get('wiki_url') or '本地已保存'}"
+        for r in processed
+    ) or "（无）"
+    skipped_info    = "\n".join(
+        f"- {r['full_name']} ({r['language'] or '-'})"
+        for r in skipped
+    ) or "（无）"
+
+    prompt = DIGEST_PROMPT.format(
+        date           = date_str,
+        new_count      = len(new_repos),
+        new_repos_info = new_repos_info,
+        processed_count= len(processed),
+        processed_info = processed_info,
+        skipped_count  = len(skipped),
+        skipped_info   = skipped_info,
+    )
+
+    try:
+        import anthropic
+        print("  AI 生成中文日报 …")
+        client  = anthropic.Anthropic(api_key=AI_API_KEY, base_url=AI_BASE_URL)
+        message = client.messages.create(
+            model     = AI_MODEL,
+            max_tokens= 4096,
+            messages  = [{"role": "user", "content": prompt}],
+        )
+        digest = message.content[0].text
+        print("  ✓ 日报生成完成")
+        return digest
+    except Exception as e:
+        print(f"  ⚠ AI 日报生成失败（{e}），使用静态模板")
+        return _build_digest_static(date_str, all_ai, new_repos, processed, skipped)
+
+
+def _build_digest_static(
+    date_str:  str,
+    all_ai:    list[dict],
+    new_repos: list[dict],
+    processed: list[dict],
+    skipped:   list[dict],
+) -> str:
+    """AI 失败时的静态降级日报（保留完整英文描述）"""
     lines = [
         f"# GitHub AI 趋势日报 · {date_str}",
         "",
-        f"> 今日 Trending 发现 **{len(all_ai)}** 个 AI 仓库，"
+        f"> 今日发现 **{len(all_ai)}** 个 AI 仓库，"
         f"新上榜 **{len(new_repos)}** 个，"
-        f"已生成知识库文章 **{len(processed)}** 篇。",
-        "",
-        "---",
-        "",
-        "## 今日新上榜 AI 仓库",
-        "",
-        "| 仓库 | 简介 | 语言 | 今日 ⭐ |",
-        "|---|---|---|---|",
+        f"已生成知识库 **{len(processed)}** 篇。",
+        "", "---", "", "## 今日新上榜 AI 仓库", "",
     ]
     for r in new_repos:
-        desc  = (r["description"][:55] + "…") if len(r["description"]) > 55 else r["description"]
-        stars = r["stars_today"] or "-"
-        lang  = r["language"] or "-"
-        lines.append(f"| [{r['full_name']}]({r['url']}) | {desc} | {lang} | {stars} |")
-
+        lines += [
+            f"### [{r['full_name']}]({r['url']})",
+            f"> {r['description'] or '（无描述）'}",
+            f"- 语言：{r['language'] or '-'}　今日 ⭐：{r['stars_today'] or '-'}",
+            "",
+        ]
     if processed:
-        lines += ["", "---", "", "## 已生成知识库文章", ""]
+        lines += ["---", "", "## 已生成知识库文章", ""]
         for r in processed:
             wiki_url = r.get("wiki_url", "")
             link = f"[📖 飞书知识库]({wiki_url})" if wiki_url else "（本地已保存）"
-            lines.append(
-                f"- **[{r['full_name']}]({r['url']})**"
-                f"  `{r['language'] or '-'}`  {r['stars_today'] or ''}\n"
-                f"  {r['description'][:80]}\n"
-                f"  {link}\n"
-            )
-
-    skipped = [r for r in all_ai if r["full_name"] not in {x["full_name"] for x in new_repos}]
+            lines.append(f"- **[{r['full_name']}]({r['url']})** — {link}")
     if skipped:
-        lines += [
-            "", "---", "",
-            f"## 历史已收录（跳过，共 {len(skipped)} 个）", "",
-            "| 仓库 | 语言 |", "|---|---|",
-        ]
-        for r in skipped[:15]:
-            lines.append(f"| [{r['full_name']}]({r['url']}) | {r['language'] or '-'} |")
-
+        lines += ["", "---", "", f"## 历史已收录（跳过 {len(skipped)} 个）", ""]
+        lines += [f"- [{r['full_name']}]({r['url']})" for r in skipped[:20]]
     lines += [
         "", "---", "",
         f"> 来源：https://github.com/trending · "
