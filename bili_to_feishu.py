@@ -162,12 +162,21 @@ def download_audio(url: str, output_dir: str) -> str:
 
 # ── Step 3: 音频转文字 ──────────────────────────────────────────────────────────
 
+# 全局 Whisper 模型缓存：批量处理时只加载一次，节省每次 ~30s 的加载时间
+_whisper_cache: dict = {}
+
+
 def transcribe(audio_path: str, model_size: str = "medium", language: str | None = None) -> tuple[str, list]:
     ensure_package("faster-whisper", "faster_whisper")
     from faster_whisper import WhisperModel
 
-    print(f"\n加载 Whisper 模型（{model_size}）…")
-    model = WhisperModel(model_size, device="auto", compute_type="auto")
+    # 命中缓存则直接复用，否则加载并缓存
+    if model_size not in _whisper_cache:
+        print(f"\n加载 Whisper 模型（{model_size}）…")
+        _whisper_cache[model_size] = WhisperModel(model_size, device="auto", compute_type="auto")
+    else:
+        print(f"\n复用已加载的 Whisper 模型（{model_size}）")
+    model = _whisper_cache[model_size]
 
     print("转录中，请稍候 …")
     segments, info = model.transcribe(audio_path, language=language, beam_size=5, vad_filter=True)
@@ -210,20 +219,33 @@ def ai_restructure(title: str, url: str, transcript: str) -> str:
 
 # ── Step 5: 写入飞书 ────────────────────────────────────────────────────────────
 
-def upload_to_feishu(title: str, content: str) -> None:
+def upload_to_feishu(title: str, content: str) -> str:
+    """创建飞书文档，返回文档 URL（失败返回空字符串）"""
+    import json as _json
     result = subprocess.run(
-        [LARK_CLI, "docs", "+create", "--title", title, "--markdown", content],
+        [LARK_CLI, "docs", "+create",
+         "--api-version", "v2",
+         "--title", title,
+         "--content", content,
+         "--doc-format", "markdown"],
         capture_output=True,
         text=True,
     )
-    if result.returncode == 0:
-        print(f"\n✓ 飞书文档已创建！\n{result.stdout.strip()}")
-    else:
+    if result.returncode != 0:
         print(f"\n✗ 飞书写入失败：{result.stderr.strip()}")
         print("请先运行：lark-cli auth login --recommend")
+        return ""
+    try:
+        data = _json.loads(result.stdout)
+        doc_url = data.get("data", {}).get("document", {}).get("url", "")
+        print(f"\n✓ 飞书文档已创建：{doc_url or result.stdout.strip()}")
+        return doc_url
+    except Exception:
+        print(f"\n✓ 飞书文档已创建\n{result.stdout.strip()}")
+        return ""
 
 
-# ── 主流程 ─────────────────────────────────────────────────────────────────────
+# ── 单视频主流程 ───────────────────────────────────────────────────────────────
 
 def run(
     url: str,
@@ -233,55 +255,128 @@ def run(
     keep_audio: bool = True,
     save_subtitle: bool = True,
     upload_feishu: bool = True,
-) -> None:
+) -> dict:
+    """
+    处理单个视频，返回结果字典：
+    {"ok": bool, "title": str, "url": str, "doc_url": str, "error": str}
+    """
     work_dir = os.path.expanduser(work_dir)
     os.makedirs(work_dir, exist_ok=True)
 
     url = clean_url(url)
     platform = detect_platform(url)
 
-    print("=" * 50)
-    print(f"平台：{'B 站' if platform == 'bilibili' else 'YouTube' if platform == 'youtube' else '未知'}")
+    print(f"\n平台：{'B 站' if platform == 'bilibili' else 'YouTube' if platform == 'youtube' else '未知'}")
     print(f"链接：{url}")
-    print("=" * 50)
 
-    print("\n[1/5] 获取视频信息 …")
-    title = get_title(url)
-    print(f"✓ 标题：{title}")
+    try:
+        print("\n[1/5] 获取视频信息 …")
+        title = get_title(url)
+        print(f"✓ 标题：{title}")
 
-    print("\n[2/5] 下载音频 …")
-    audio_path = download_audio(url, work_dir)
+        print("\n[2/5] 下载音频 …")
+        audio_path = download_audio(url, work_dir)
 
-    print("\n[3/5] 音频转文字 …")
-    full_text, segment_list = transcribe(audio_path, model_size=model_size, language=language)
+        print("\n[3/5] 音频转文字 …")
+        full_text, segment_list = transcribe(audio_path, model_size=model_size, language=language)
 
-    base = os.path.splitext(audio_path)[0]
+        base = os.path.splitext(audio_path)[0]
 
-    if save_subtitle:
-        save_srt(segment_list, base + ".srt")
+        if save_subtitle:
+            save_srt(segment_list, base + ".srt")
 
-    with open(base + ".txt", "w", encoding="utf-8") as f:
-        f.write(full_text)
-    print(f"✓ 原始文本已保存：{base}.txt")
+        with open(base + ".txt", "w", encoding="utf-8") as f:
+            f.write(full_text)
+        print(f"✓ 原始文本已保存：{base}.txt")
 
-    print("\n[4/5] AI 重构为知识库文章 …")
-    article = ai_restructure(title=title, url=url, transcript=full_text)
+        print("\n[4/5] AI 重构为知识库文章 …")
+        article = ai_restructure(title=title, url=url, transcript=full_text)
 
-    with open(base + "_知识库.md", "w", encoding="utf-8") as f:
-        f.write(article)
-    print(f"✓ 知识库文章已保存：{base}_知识库.md")
+        with open(base + "_知识库.md", "w", encoding="utf-8") as f:
+            f.write(article)
+        print(f"✓ 知识库文章已保存：{base}_知识库.md")
 
-    if upload_feishu:
-        print("\n[5/5] 写入飞书 …")
-        upload_to_feishu(title=f"【知识库】{title}", content=article)
-    else:
-        print("\n[5/5] 跳过飞书上传（upload_feishu=False）")
+        doc_url = ""
+        if upload_feishu:
+            print("\n[5/5] 写入飞书 …")
+            doc_url = upload_to_feishu(title=f"【知识库】{title}", content=article)
+        else:
+            print("\n[5/5] 跳过飞书上传（upload_feishu=False）")
 
-    if not keep_audio:
-        os.remove(audio_path)
-        print(f"已删除临时音频：{audio_path}")
+        if not keep_audio:
+            os.remove(audio_path)
+            print(f"已删除临时音频：{audio_path}")
 
-    print("\n✅ 全部完成！")
+        return {"ok": True, "title": title, "url": url, "doc_url": doc_url, "error": ""}
+
+    except Exception as e:
+        import traceback
+        print(f"\n✗ 处理失败：{e}")
+        traceback.print_exc()
+        return {"ok": False, "title": "", "url": url, "doc_url": "", "error": str(e)}
+
+
+# ── 批量处理多个视频 ───────────────────────────────────────────────────────────
+
+def run_batch(
+    urls: list[str],
+    work_dir: str = "~/Downloads/bili_to_feishu",
+    model_size: str = "medium",
+    language: str | None = None,
+    keep_audio: bool = True,
+    save_subtitle: bool = True,
+    upload_feishu: bool = True,
+) -> None:
+    """
+    按顺序处理多个视频链接。
+    单个失败不中断，继续处理下一个，最后打印汇总结果。
+    Whisper 模型只加载一次，全程复用。
+    """
+    total   = len(urls)
+    results = []
+
+    print("=" * 60)
+    print(f"批量处理模式  ·  共 {total} 个视频")
+    print("=" * 60)
+
+    for i, url in enumerate(urls, 1):
+        print(f"\n{'━' * 60}")
+        print(f"  [{i}/{total}]  {url.strip()}")
+        print(f"{'━' * 60}")
+
+        result = run(
+            url          = url,
+            work_dir     = work_dir,
+            model_size   = model_size,
+            language     = language,
+            keep_audio   = keep_audio,
+            save_subtitle= save_subtitle,
+            upload_feishu= upload_feishu,
+        )
+        results.append(result)
+
+        status = "✅ 成功" if result["ok"] else "❌ 失败"
+        print(f"\n{status}  [{i}/{total}]  {result.get('title') or url}")
+
+    # ── 汇总 ──────────────────────────────────────────────────────
+    succeeded = [r for r in results if r["ok"]]
+    failed    = [r for r in results if not r["ok"]]
+
+    print(f"\n{'═' * 60}")
+    print(f"  全部完成！成功 {len(succeeded)}/{total}  失败 {len(failed)}/{total}")
+    print(f"{'═' * 60}")
+
+    if succeeded:
+        print("\n✅ 成功：")
+        for r in succeeded:
+            doc = f"  → {r['doc_url']}" if r["doc_url"] else ""
+            print(f"  • {r['title']}{doc}")
+
+    if failed:
+        print("\n❌ 失败：")
+        for r in failed:
+            print(f"  • {r['url']}")
+            print(f"    原因：{r['error']}")
 
 
 # ── 从已有 txt 直接跑 AI + 飞书 ───────────────────────────────────────────────
@@ -323,10 +418,36 @@ def run_from_txt(
 
 # ── 入口 ───────────────────────────────────────────────────────────────────────
 
+def _collect_urls() -> list[str]:
+    """
+    收集视频链接：
+    - 命令行传入多个链接：python bili_to_feishu.py url1 url2 url3
+    - 交互式：每行一个，空行结束（支持直接粘贴多行）
+    """
+    # 命令行参数（跳过脚本名本身，过滤掉 --xxx 参数）
+    cli_urls = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if cli_urls:
+        return cli_urls
+
+    # 交互式输入
+    print("请输入视频链接（B 站 / YouTube），每行一个，输入空行开始处理：")
+    urls = []
+    while True:
+        try:
+            line = input("  > ").strip()
+        except EOFError:
+            break
+        if not line:
+            if urls:
+                break
+            continue
+        urls.append(line)
+    return urls
+
+
 if __name__ == "__main__":
-    # 模式 A：完整流程（下载 → 转录 → AI → 飞书）
-    # 模式 B：从已有 txt 直接跑 AI + 飞书（跳过下载和转录）
-    MODE = "A"
+    # ── 模式 B：从已有 txt 直接跑 AI + 飞书（改这里） ──────────────────────────
+    MODE = "A"   # "A" = 完整流程   "B" = 从 txt 跳过下载和转录
 
     if MODE == "B":
         run_from_txt(
@@ -335,18 +456,33 @@ if __name__ == "__main__":
             url="https://www.bilibili.com/video/BV1BXQABNE4y/",
             upload_feishu=True,
         )
-    else:
-        if len(sys.argv) > 1:
-            video_url = sys.argv[1]
-        else:
-            video_url = input("请输入视频链接（B 站 / YouTube）：").strip()
+        sys.exit(0)
 
+    # ── 模式 A：批量完整流程 ────────────────────────────────────────────────────
+    urls = _collect_urls()
+    if not urls:
+        print("未输入任何链接，退出。")
+        sys.exit(0)
+
+    if len(urls) == 1:
+        # 单个链接：走原有单视频流程，保持输出简洁
         run(
-            url=video_url,
-            work_dir="~/Downloads/bili_to_feishu",
-            model_size="medium",     # Whisper 模型：tiny / small / medium / large
-            language=None,           # None=自动检测  "zh"=中文  "en"=英文
-            keep_audio=True,
-            save_subtitle=True,
-            upload_feishu=True,
+            url          = urls[0],
+            work_dir     = "~/Downloads/bili_to_feishu",
+            model_size   = "medium",
+            language     = None,
+            keep_audio   = True,
+            save_subtitle= True,
+            upload_feishu= True,
+        )
+    else:
+        # 多个链接：批量模式
+        run_batch(
+            urls         = urls,
+            work_dir     = "~/Downloads/bili_to_feishu",
+            model_size   = "medium",
+            language     = None,
+            keep_audio   = True,
+            save_subtitle= True,
+            upload_feishu= True,
         )
