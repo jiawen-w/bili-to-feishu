@@ -1,14 +1,16 @@
 """
-GitHub Trending → AI 过滤 → 飞书知识库
-每日自动爬取 GitHub Trending，筛选 AI 相关仓库，跨日去重后写入飞书
+GitHub Trending → AI 过滤 → 飞书知识库子文档
+每日自动爬取 GitHub Trending，筛选 AI 相关仓库，
+跨日去重后以子文档形式写入指定飞书知识库页面。
 
 功能：
-1. 抓取 https://github.com/trending 当日热门仓库（默认 daily）
-2. 关键词快速过滤 AI 相关仓库
-3. 对比缓存，跳过已处理过的仓库（跨日去重）
-4. 为每个新 AI 仓库抓取源码/文档 → AI 重构知识库文章 → 写入飞书
-5. 额外生成一份"今日 AI 趋势日报"汇总写入飞书
-6. 更新本地缓存
+1. 抓取 https://github.com/trending 当日热门仓库
+2. 两级关键词过滤 AI 相关仓库（强词直接命中，弱词需 ≥2 个）
+3. 对比本地缓存，跳过已处理仓库（跨日去重）
+4. 每日最多处理 5 个新仓库：
+   - 抓取 GitHub 源码/文档 → AI 重构知识库文章 → 作为子文档写入飞书知识库
+5. 另生成今日趋势日报，同样写为知识库子文档
+6. 更新本地 JSON 缓存
 
 依赖：
     pip install requests beautifulsoup4 anthropic
@@ -17,7 +19,10 @@ GitHub Trending → AI 过滤 → 飞书知识库
     python trending_to_feishu.py                # 正常运行
     python trending_to_feishu.py --dry-run      # 预览，不调用 AI 和飞书
     python trending_to_feishu.py --no-feishu    # 只生成本地文件，不上传飞书
+    python trending_to_feishu.py --weekly       # 改为抓取本周热门
 """
+
+from __future__ import annotations
 
 import os
 import re
@@ -29,21 +34,25 @@ from datetime import datetime
 from bs4 import BeautifulSoup
 
 
-# ── 配置（与 github_to_feishu.py 保持一致）─────────────────────────────────────
+# ── 配置 ──────────────────────────────────────────────────────────────────────
 
 AI_BASE_URL  = "https://ark.cn-beijing.volces.com/api/coding"
 AI_API_KEY   = "1d3ace95-c577-4eee-ae9d-4fc85f3d07ee"
 AI_MODEL     = "doubao-seed-2.0-pro"
 LARK_CLI     = "/Users/chenjiawen/.hermes/node/bin/lark-cli"
 
+# 目标飞书知识库节点（所有子文档将挂在此节点下）
+# https://icanx2007.feishu.cn/wiki/YUXew6c5ci2FQbkrQzmc13axnTc
+WIKI_NODE_TOKEN = "YUXew6c5ci2FQbkrQzmc13axnTc"
+
 # 输出目录 & 缓存文件
 OUTPUT_DIR   = os.path.expanduser("~/Downloads/trending_to_feishu")
 CACHE_FILE   = os.path.join(OUTPUT_DIR, "seen_repos.json")
 
-# 每次最多处理几个仓库（防止 API 费用过高）
+# 每次最多处理几个仓库（每个仓库对应一个知识库子文档）
 MAX_REPOS_PER_RUN = 5
 
-# 抓取这些扩展名的文件（与 github_to_feishu.py 一致）
+# 抓取这些扩展名的文件
 INCLUDE_EXTS = {".md", ".py", ".js", ".ts", ".json", ".yaml", ".yml", ".toml", ".txt", ".sh"}
 SKIP_DIRS    = {"node_modules", ".git", "__pycache__", ".venv", "dist", "build", "evals", "reports"}
 
@@ -66,7 +75,7 @@ AI_KEYWORDS_STRONG = {
     "自然语言处理", "向量数据库", "知识图谱",
 }
 
-# 弱关键词：需要组合出现或在关键位置才算 AI
+# 弱关键词：命中 ≥2 个才算 AI 相关
 AI_KEYWORDS_WEAK = {
     "ai", "ml", "neural", "model", "inference", "training", "dataset",
     "agent", "chatbot", "nlp", "computer-vision", "deep-learning",
@@ -78,34 +87,15 @@ AI_KEYWORDS_WEAK = {
 
 
 def is_ai_related(repo: dict) -> bool:
-    """
-    两级关键词判断：
-    - 命中强关键词 → 直接判定为 AI 相关
-    - 命中 2 个及以上弱关键词 → 判定为 AI 相关
-    """
     text = f"{repo['full_name']} {repo['description']}".lower()
-    # 强关键词
-    for kw in AI_KEYWORDS_STRONG:
-        if kw in text:
-            return True
-    # 弱关键词：至少命中 2 个
-    hits = sum(1 for kw in AI_KEYWORDS_WEAK if kw in text)
-    return hits >= 2
+    if any(kw in text for kw in AI_KEYWORDS_STRONG):
+        return True
+    return sum(1 for kw in AI_KEYWORDS_WEAK if kw in text) >= 2
 
 
 # ── 缓存（跨日去重）──────────────────────────────────────────────────────────
 
 def load_cache() -> dict:
-    """
-    缓存格式：
-    {
-      "seen": ["owner/repo1", "owner/repo2", ...],
-      "history": [
-        {"date": "2026-05-09", "repos": ["owner/repo1", ...]},
-        ...
-      ]
-    }
-    """
     if not os.path.exists(CACHE_FILE):
         return {"seen": [], "history": []}
     with open(CACHE_FILE, encoding="utf-8") as f:
@@ -121,12 +111,8 @@ def save_cache(cache: dict) -> None:
 
 # ── 抓取 GitHub Trending ───────────────────────────────────────────────────────
 
-def fetch_trending(language: str = "", since: str = "daily") -> list[dict]:
-    """
-    抓取 GitHub Trending，返回仓库列表。
-    每条记录：{full_name, url, description, language, stars_today}
-    """
-    url = f"https://github.com/trending/{language}?since={since}"
+def fetch_trending(since: str = "daily") -> list[dict]:
+    url = f"https://github.com/trending?since={since}"
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -135,7 +121,7 @@ def fetch_trending(language: str = "", since: str = "daily") -> list[dict]:
         ),
         "Accept-Language": "en-US,en;q=0.9",
     }
-    print(f"  抓取 GitHub Trending：{url}")
+    print(f"  抓取：{url}")
     resp = requests.get(url, headers=headers, timeout=20)
     resp.raise_for_status()
 
@@ -143,23 +129,16 @@ def fetch_trending(language: str = "", since: str = "daily") -> list[dict]:
     repos = []
 
     for article in soup.select("article.Box-row"):
-        # 仓库名
         h2 = article.select_one("h2 a")
         if not h2:
             continue
-        full_name = h2.get("href", "").strip("/")  # "owner/repo"
+        full_name = h2.get("href", "").strip("/")
         if not full_name or "/" not in full_name:
             continue
 
-        # 简介
-        desc_el = article.select_one("p")
-        description = desc_el.get_text(strip=True) if desc_el else ""
+        desc_el   = article.select_one("p")
+        lang_el   = article.select_one("[itemprop='programmingLanguage']")
 
-        # 编程语言
-        lang_el = article.select_one("[itemprop='programmingLanguage']")
-        lang = lang_el.get_text(strip=True) if lang_el else ""
-
-        # 今日 Star 数
         stars_today = ""
         for span in article.select("span.d-inline-block"):
             txt = span.get_text(strip=True)
@@ -167,19 +146,17 @@ def fetch_trending(language: str = "", since: str = "daily") -> list[dict]:
                 stars_today = txt
                 break
 
-        # 总 Star 数
         total_stars = ""
         for a in article.select("a.Link--muted"):
-            href = a.get("href", "")
-            if href.endswith("/stargazers"):
+            if a.get("href", "").endswith("/stargazers"):
                 total_stars = a.get_text(strip=True)
                 break
 
         repos.append({
-            "full_name": full_name,
-            "url": f"https://github.com/{full_name}",
-            "description": description,
-            "language": lang,
+            "full_name":   full_name,
+            "url":         f"https://github.com/{full_name}",
+            "description": desc_el.get_text(strip=True) if desc_el else "",
+            "language":    lang_el.get_text(strip=True) if lang_el else "",
             "stars_today": stars_today,
             "total_stars": total_stars,
         })
@@ -187,16 +164,15 @@ def fetch_trending(language: str = "", since: str = "daily") -> list[dict]:
     return repos
 
 
-# ── 复用 github_to_feishu.py 的核心逻辑 ──────────────────────────────────────
+# ── GitHub 内容抓取（来自 github_to_feishu.py）───────────────────────────────
 
 def fetch_dir(owner: str, repo: str, path: str) -> list[dict]:
-    """递归获取目录下所有文件信息（来自 github_to_feishu.py）"""
     api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
     try:
         resp = requests.get(api_url, timeout=15)
         resp.raise_for_status()
     except Exception as e:
-        print(f"  ⚠ GitHub API 请求失败：{e}")
+        print(f"  ⚠ GitHub API 失败：{e}")
         return []
 
     items = resp.json()
@@ -207,49 +183,39 @@ def fetch_dir(owner: str, repo: str, path: str) -> list[dict]:
     for item in items:
         name = item.get("name", "")
         if item["type"] == "dir":
-            if name in SKIP_DIRS:
-                continue
-            files.extend(fetch_dir(owner, repo, item["path"]))
+            if name not in SKIP_DIRS:
+                files.extend(fetch_dir(owner, repo, item["path"]))
         elif item["type"] == "file":
-            ext = os.path.splitext(name)[1].lower()
-            if ext in INCLUDE_EXTS:
+            if os.path.splitext(name)[1].lower() in INCLUDE_EXTS:
                 files.append(item)
     return files
 
 
 def fetch_repo_content(github_url: str) -> tuple[str, str]:
-    """
-    抓取仓库内容，返回 (项目标题, 合并后的文本)
-    内容超过 MAX_CONTENT_CHARS 时自动截断
-    （来自 github_to_feishu.py，增加截断保护）
-    """
-    url = github_url.rstrip("/")
+    url   = github_url.rstrip("/")
     match = re.match(r"https://github\.com/([^/]+)/([^/]+)(?:/tree/[^/]+/(.*))?", url)
     if not match:
-        raise ValueError(f"无法解析 GitHub URL：{url}")
-    owner = match.group(1)
-    repo  = match.group(2)
-    path  = match.group(3) or ""
+        raise ValueError(f"无法解析：{url}")
+    owner, repo, path = match.group(1), match.group(2), match.group(3) or ""
     title = f"{repo}/{path}" if path else repo
 
     print(f"  仓库：{owner}/{repo}")
     files = fetch_dir(owner, repo, path)
-    print(f"  找到 {len(files)} 个文件")
+    print(f"  文件数：{len(files)}")
 
-    parts = [f"# 项目：{title}\n来源：{github_url}\n"]
+    parts       = [f"# 项目：{title}\n来源：{github_url}\n"]
     total_chars = 0
 
     for f in files:
         if total_chars >= MAX_CONTENT_CHARS:
-            parts.append(f"\n\n---\n**（内容过长，已截断，后续 {len(files)} 个文件略过）**")
+            parts.append("\n\n---\n**（内容过长，已截断）**")
             break
         print(f"  读取：{f['path']}")
         try:
-            resp = requests.get(f["download_url"], timeout=15)
-            resp.raise_for_status()
-            content = resp.text
-            ext = os.path.splitext(f["name"])[1]
-            chunk = f"\n\n---\n## 文件：{f['path']}\n\n```{ext.lstrip('.')}\n{content}\n```"
+            r    = requests.get(f["download_url"], timeout=15)
+            r.raise_for_status()
+            ext  = os.path.splitext(f["name"])[1]
+            chunk = f"\n\n---\n## 文件：{f['path']}\n\n```{ext.lstrip('.')}\n{r.text}\n```"
             parts.append(chunk)
             total_chars += len(chunk)
         except Exception as e:
@@ -257,6 +223,8 @@ def fetch_repo_content(github_url: str) -> tuple[str, str]:
 
     return title, "\n".join(parts)
 
+
+# ── AI 重构 ───────────────────────────────────────────────────────────────────
 
 KNOWLEDGE_PROMPT = """\
 你是专业技术文档/知识库编撰工程师，我给你一个 GitHub 项目的完整源码和文档，请把它重构为**标准化精品技术知识库教程**。
@@ -289,107 +257,150 @@ KNOWLEDGE_PROMPT = """\
 
 
 def ai_restructure(title: str, url: str, content: str) -> str:
-    """AI 重构为知识库文章（来自 github_to_feishu.py）"""
     import anthropic
-    print("  AI 重构中，请稍候 …")
-    client = anthropic.Anthropic(api_key=AI_API_KEY, base_url=AI_BASE_URL)
-    prompt = KNOWLEDGE_PROMPT.format(title=title, url=url, content=content)
+    print("  AI 重构中 …")
+    client  = anthropic.Anthropic(api_key=AI_API_KEY, base_url=AI_BASE_URL)
     message = client.messages.create(
         model=AI_MODEL,
         max_tokens=8192,
-        messages=[{"role": "user", "content": prompt}],
+        messages=[{"role": "user", "content": KNOWLEDGE_PROMPT.format(
+            title=title, url=url, content=content
+        )}],
     )
     print("  ✓ AI 重构完成")
     return message.content[0].text
 
 
-def upload_to_feishu(title: str, content: str) -> str:
-    """写入飞书，返回文档 URL（来自 github_to_feishu.py）"""
-    result = subprocess.run(
-        [LARK_CLI, "docs", "+create",
-         "--api-version", "v2",
-         "--title", title,
-         "--content", content,
-         "--doc-format", "markdown"],
+# ── 写入飞书知识库子文档（两步法）────────────────────────────────────────────
+
+def upload_to_wiki(title: str, content: str) -> str:
+    """
+    在 WIKI_NODE_TOKEN 下创建一个子文档，写入 Markdown 内容。
+    返回飞书 wiki 页面 URL；失败返回空字符串。
+
+    两步：
+    1. wiki +node-create → 创建 wiki 子节点，拿到 obj_token（即文档 ID）
+    2. docs +update --command overwrite → 将内容写入该文档
+    """
+    # ── Step 1: 创建 wiki 子节点 ──────────────────────────────────
+    r1 = subprocess.run(
+        [
+            LARK_CLI, "wiki", "+node-create",
+            "--parent-node-token", WIKI_NODE_TOKEN,
+            "--title", title,
+        ],
         capture_output=True, text=True,
     )
-    if result.returncode != 0:
-        print(f"  ✗ 飞书写入失败：{result.stderr.strip()}")
-        return ""
+
+    # lark-cli 在 stdout 混入了进度文字，只取 JSON 部分
+    json_text = ""
+    for line in r1.stdout.splitlines():
+        if line.strip().startswith("{"):
+            json_text = "\n".join(
+                l for l in r1.stdout.splitlines()
+                if l.strip().startswith("{") or json_text
+            )
+            break
+
+    # 更健壮：直接从整段输出里提取 JSON 块
     try:
-        import json as _json
-        data = _json.loads(result.stdout)
-        doc_url = data.get("data", {}).get("document", {}).get("url", "")
-        if doc_url:
-            print(f"  ✓ 飞书文档已创建：{doc_url}")
-        return doc_url
-    except Exception:
-        print(f"  ✓ 飞书文档已创建\n{result.stdout.strip()}")
+        json_match = re.search(r"\{[\s\S]+\}", r1.stdout)
+        if not json_match:
+            raise ValueError("未找到 JSON")
+        node_data = json.loads(json_match.group())
+        obj_token  = node_data["data"]["obj_token"]
+        wiki_url   = node_data["data"]["url"]
+    except Exception as e:
+        print(f"  ✗ wiki 节点创建失败：{e}\n  原始输出：{r1.stdout[:300]}")
+        if r1.stderr:
+            print(f"  stderr：{r1.stderr[:200]}")
         return ""
 
+    print(f"  ✓ wiki 子节点已创建：{wiki_url}")
 
-# ── 今日日报生成 ─────────────────────────────────────────────────────────────
+    # ── Step 2: 写入内容 ───────────────────────────────────────────
+    r2 = subprocess.run(
+        [
+            LARK_CLI, "docs", "+update",
+            "--api-version", "v2",
+            "--doc", obj_token,
+            "--content", content,
+            "--doc-format", "markdown",
+            "--command", "overwrite",
+        ],
+        capture_output=True, text=True,
+    )
+
+    if r2.returncode != 0:
+        print(f"  ✗ 内容写入失败：{r2.stderr.strip()}")
+        return wiki_url  # 节点已建，返回 URL，内容可手动补填
+
+    try:
+        r2_data = json.loads(r2.stdout)
+        if r2_data.get("ok"):
+            print(f"  ✓ 内容写入成功")
+        else:
+            print(f"  ⚠ 内容写入返回异常：{r2.stdout[:200]}")
+    except Exception:
+        pass
+
+    return wiki_url
+
+
+# ── 今日日报 ──────────────────────────────────────────────────────────────────
 
 def build_digest(
-    date_str: str,
-    all_ai_repos: list[dict],
-    new_repos: list[dict],
-    processed: list[dict],
+    date_str:    str,
+    all_ai:      list[dict],
+    new_repos:   list[dict],
+    processed:   list[dict],
 ) -> str:
-    """生成今日 AI 趋势日报 Markdown"""
     lines = [
         f"# GitHub AI 趋势日报 · {date_str}",
         "",
-        f"> 今日 GitHub Trending 共发现 **{len(all_ai_repos)}** 个 AI 相关仓库，"
-        f"其中 **{len(new_repos)}** 个为新上榜，已为 **{len(processed)}** 个生成知识库文章。",
+        f"> 今日 Trending 发现 **{len(all_ai)}** 个 AI 仓库，"
+        f"新上榜 **{len(new_repos)}** 个，"
+        f"已生成知识库文章 **{len(processed)}** 篇。",
         "",
         "---",
         "",
         "## 今日新上榜 AI 仓库",
         "",
-        "| 仓库 | 简介 | 语言 | 今日 Star |",
+        "| 仓库 | 简介 | 语言 | 今日 ⭐ |",
         "|---|---|---|---|",
     ]
     for r in new_repos:
-        name = r["full_name"]
-        url  = r["url"]
-        desc = r["description"][:60] + "…" if len(r["description"]) > 60 else r["description"]
-        lang = r["language"] or "-"
+        desc  = (r["description"][:55] + "…") if len(r["description"]) > 55 else r["description"]
         stars = r["stars_today"] or "-"
-        lines.append(f"| [{name}]({url}) | {desc} | {lang} | {stars} |")
+        lang  = r["language"] or "-"
+        lines.append(f"| [{r['full_name']}]({r['url']}) | {desc} | {lang} | {stars} |")
 
     if processed:
-        lines += [
-            "",
-            "---",
-            "",
-            "## 已生成知识库文章",
-            "",
-        ]
+        lines += ["", "---", "", "## 已生成知识库文章", ""]
         for r in processed:
-            doc_url = r.get("doc_url", "")
-            link = f"[飞书文档]({doc_url})" if doc_url else "（本地已保存）"
-            lines.append(f"- **[{r['full_name']}]({r['url']})** — {r['description'][:80]}  \n  {link}")
+            wiki_url = r.get("wiki_url", "")
+            link = f"[📖 飞书知识库]({wiki_url})" if wiki_url else "（本地已保存）"
+            lines.append(
+                f"- **[{r['full_name']}]({r['url']})**"
+                f"  `{r['language'] or '-'}`  {r['stars_today'] or ''}\n"
+                f"  {r['description'][:80]}\n"
+                f"  {link}\n"
+            )
 
-    if len(all_ai_repos) > len(new_repos):
-        skipped = [r for r in all_ai_repos if r["full_name"] not in {n["full_name"] for n in new_repos}]
+    skipped = [r for r in all_ai if r["full_name"] not in {x["full_name"] for x in new_repos}]
+    if skipped:
         lines += [
-            "",
-            "---",
-            "",
-            f"## 历史已收录（今日重复，跳过，共 {len(skipped)} 个）",
-            "",
-            "| 仓库 | 语言 |",
-            "|---|---|",
+            "", "---", "",
+            f"## 历史已收录（跳过，共 {len(skipped)} 个）", "",
+            "| 仓库 | 语言 |", "|---|---|",
         ]
-        for r in skipped[:20]:  # 最多显示 20 条
+        for r in skipped[:15]:
             lines.append(f"| [{r['full_name']}]({r['url']}) | {r['language'] or '-'} |")
 
     lines += [
-        "",
-        "---",
-        "",
-        f"> 来源：https://github.com/trending · 生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "", "---", "",
+        f"> 来源：https://github.com/trending · "
+        f"生成：{datetime.now().strftime('%Y-%m-%d %H:%M')}",
     ]
     return "\n".join(lines)
 
@@ -397,135 +408,147 @@ def build_digest(
 # ── 主流程 ────────────────────────────────────────────────────────────────────
 
 def run(
-    since: str = "daily",
-    max_repos: int = MAX_REPOS_PER_RUN,
+    since:        str  = "daily",
+    max_repos:    int  = MAX_REPOS_PER_RUN,
     upload_feishu: bool = True,
-    dry_run: bool = False,
+    dry_run:      bool = False,
 ) -> None:
     today = datetime.now().strftime("%Y-%m-%d")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     print("=" * 60)
-    print(f"GitHub AI Trending  ·  {today}")
+    print(f"GitHub AI Trending → 飞书知识库  ·  {today}")
+    print(f"目标节点：https://icanx2007.feishu.cn/wiki/{WIKI_NODE_TOKEN}")
     print("=" * 60)
 
     # ── Step 1：抓取 Trending ──────────────────────────────────────
-    print("\n[1/5] 抓取 GitHub Trending …")
+    print(f"\n[1/5] 抓取 GitHub Trending（{since}）…")
     try:
         repos = fetch_trending(since=since)
     except Exception as e:
         print(f"✗ 抓取失败：{e}")
         return
-    print(f"✓ 共找到 {len(repos)} 个热门仓库")
+    print(f"✓ 共 {len(repos)} 个热门仓库")
 
     # ── Step 2：AI 关键词过滤 ──────────────────────────────────────
     print("\n[2/5] AI 关键词过滤 …")
     ai_repos = [r for r in repos if is_ai_related(r)]
-    print(f"✓ 过滤出 {len(ai_repos)} 个 AI 相关仓库")
+    print(f"✓ AI 相关：{len(ai_repos)} 个")
     for r in ai_repos:
-        print(f"  • {r['full_name']}  [{r['language']}]  {r['stars_today']}")
-        print(f"    {r['description'][:80]}")
+        flag = "⭐" if r["stars_today"] else " "
+        print(f"  {flag} {r['full_name']}  [{r['language']}]  {r['stars_today']}")
+        if r["description"]:
+            print(f"    {r['description'][:80]}")
 
     # ── Step 3：跨日去重 ───────────────────────────────────────────
-    print("\n[3/5] 对比历史缓存，去重 …")
-    cache = load_cache()
+    print("\n[3/5] 去重（对比历史缓存）…")
+    cache    = load_cache()
     seen_set = set(cache.get("seen", []))
-    new_ai_repos = [r for r in ai_repos if r["full_name"] not in seen_set]
-    print(f"✓ 新仓库 {len(new_ai_repos)} 个（历史已收录 {len(ai_repos) - len(new_ai_repos)} 个，跳过）")
+    new_ai   = [r for r in ai_repos if r["full_name"] not in seen_set]
+    skipped  = len(ai_repos) - len(new_ai)
+    print(f"✓ 新仓库 {len(new_ai)} 个（跳过历史已收录 {skipped} 个）")
 
-    if not new_ai_repos:
-        print("\n今日无新增 AI 仓库，写入日报并退出。")
-        digest = build_digest(today, ai_repos, new_ai_repos, [])
+    if not new_ai:
+        print("\n今日无新 AI 仓库，仅写日报。")
+        digest = build_digest(today, ai_repos, [], [])
+        _save_local(digest, f"{today.replace('-','')}_AI趋势日报.md")
         if upload_feishu and not dry_run:
-            upload_to_feishu(title=f"GitHub AI 趋势日报 · {today}", content=digest)
+            upload_to_wiki(f"GitHub AI 趋势日报 · {today}", digest)
         return
 
-    # 取前 max_repos 个处理
-    to_process = new_ai_repos[:max_repos]
-    if len(new_ai_repos) > max_repos:
-        print(f"  （本次最多处理 {max_repos} 个，剩余 {len(new_ai_repos) - max_repos} 个留到下次）")
+    to_process = new_ai[:max_repos]
+    if len(new_ai) > max_repos:
+        print(f"  （每日上限 {max_repos} 个，剩余 {len(new_ai)-max_repos} 个留到明天）")
 
     if dry_run:
-        print("\n[DRY RUN] 以下仓库将被处理：")
+        print(f"\n[DRY RUN] 今日将处理 {len(to_process)} 个仓库：")
         for r in to_process:
-            print(f"  → {r['full_name']}  {r['url']}")
-        print("\n[DRY RUN] 跳过 AI 重构和飞书上传。")
+            print(f"  → {r['full_name']}")
+        print("[DRY RUN] 跳过 AI 重构和飞书上传。")
         return
 
-    # ── Step 4：逐仓库处理 ─────────────────────────────────────────
-    print(f"\n[4/5] 处理 {len(to_process)} 个仓库 …")
-    processed = []
+    # ── Step 4：逐仓库处理 → 写知识库子文档 ──────────────────────
+    print(f"\n[4/5] 处理 {len(to_process)} 个仓库，每个写为知识库子文档 …")
+    processed  = []
     newly_seen = []
 
     for i, repo in enumerate(to_process, 1):
-        print(f"\n  [{i}/{len(to_process)}] {repo['full_name']}")
+        print(f"\n  ── [{i}/{len(to_process)}] {repo['full_name']} ──")
         try:
             title, content = fetch_repo_content(repo["url"])
             article = ai_restructure(title=title, url=repo["url"], content=content)
 
-            # 本地保存
-            safe_name = re.sub(r'[\\/:*?"<>|]', "_", repo["full_name"].replace("/", "_"))
-            date_prefix = today.replace("-", "")
-            out_path = os.path.join(OUTPUT_DIR, f"{date_prefix}_{safe_name}_知识库.md")
-            with open(out_path, "w", encoding="utf-8") as f:
-                f.write(article)
-            print(f"  ✓ 本地已保存：{out_path}")
+            # 本地备份
+            safe = re.sub(r'[\\/:*?"<>|]', "_", repo["full_name"].replace("/", "_"))
+            local_path = _save_local(article, f"{today.replace('-','')}_{safe}_知识库.md")
 
-            doc_url = ""
+            # 写飞书知识库子文档
+            wiki_url = ""
             if upload_feishu:
-                doc_url = upload_to_feishu(
-                    title=f"【AI趋势】{repo['full_name']}",
-                    content=article,
+                wiki_url = upload_to_wiki(
+                    title   = f"【AI趋势·{today}】{repo['full_name']}",
+                    content = article,
                 )
 
-            processed.append({**repo, "doc_url": doc_url})
+            processed.append({**repo, "wiki_url": wiki_url})
             newly_seen.append(repo["full_name"])
 
         except Exception as e:
+            import traceback
             print(f"  ✗ 处理失败：{e}")
-            # 失败的仓库也记入 seen，避免反复重试卡住（可根据需求改为不记入）
-            newly_seen.append(repo["full_name"])
+            traceback.print_exc()
+            newly_seen.append(repo["full_name"])  # 失败也记入，避免卡同一仓库
 
-    # 未处理的新仓库也加入 seen（下次再处理）
-    # 如果不想这样，将下行注释掉，让未处理的仓库下次继续排队
-    for r in new_ai_repos[max_repos:]:
-        newly_seen.append(r["full_name"])
+    # 本次未处理的新仓库：留到明天（不写入 seen）
+    # 若想今天全部标记掉，取消下面注释：
+    # for r in new_ai[max_repos:]: newly_seen.append(r["full_name"])
 
-    # ── Step 5：写日报 ─────────────────────────────────────────────
+    # ── Step 5：写日报子文档 ───────────────────────────────────────
     print("\n[5/5] 生成今日 AI 趋势日报 …")
-    digest = build_digest(today, ai_repos, new_ai_repos, processed)
-
-    digest_path = os.path.join(OUTPUT_DIR, f"{today.replace('-', '')}_AI趋势日报.md")
-    with open(digest_path, "w", encoding="utf-8") as f:
-        f.write(digest)
-    print(f"✓ 日报已保存：{digest_path}")
+    digest = build_digest(today, ai_repos, new_ai, processed)
+    _save_local(digest, f"{today.replace('-','')}_AI趋势日报.md")
 
     if upload_feishu:
-        upload_to_feishu(title=f"GitHub AI 趋势日报 · {today}", content=digest)
+        upload_to_wiki(
+            title   = f"GitHub AI 趋势日报 · {today}",
+            content = digest,
+        )
 
     # ── 更新缓存 ───────────────────────────────────────────────────
     seen_set.update(newly_seen)
     cache["seen"] = list(seen_set)
     cache.setdefault("history", []).append({
-        "date": today,
-        "all_ai_repos": [r["full_name"] for r in ai_repos],
-        "new_repos": [r["full_name"] for r in new_ai_repos],
+        "date":      today,
+        "ai_repos":  [r["full_name"] for r in ai_repos],
+        "new":       [r["full_name"] for r in new_ai],
         "processed": [r["full_name"] for r in processed],
     })
     save_cache(cache)
 
-    print(f"\n✅ 完成！本次处理 {len(processed)} 个仓库，日报已写入飞书。")
+    print(f"\n✅ 完成！生成 {len(processed)} 篇知识库子文档 + 1 份日报。")
+    print(f"   飞书知识库：https://icanx2007.feishu.cn/wiki/{WIKI_NODE_TOKEN}")
+
+
+# ── 工具 ──────────────────────────────────────────────────────────────────────
+
+def _save_local(content: str, filename: str) -> str:
+    path = os.path.join(OUTPUT_DIR, filename)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    print(f"  ✓ 本地保存：{path}")
+    return path
 
 
 # ── 入口 ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    dry_run    = "--dry-run"   in sys.argv
-    no_feishu  = "--no-feishu" in sys.argv
+    dry_run   = "--dry-run"   in sys.argv
+    no_feishu = "--no-feishu" in sys.argv
+    weekly    = "--weekly"    in sys.argv
 
     run(
-        since="daily",           # daily / weekly / monthly
-        max_repos=5,             # 每次最多处理几个仓库
-        upload_feishu=not no_feishu,
-        dry_run=dry_run,
+        since         = "weekly" if weekly else "daily",
+        max_repos     = MAX_REPOS_PER_RUN,
+        upload_feishu = not no_feishu,
+        dry_run       = dry_run,
     )
