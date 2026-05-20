@@ -33,17 +33,31 @@ import requests
 from datetime import datetime
 from bs4 import BeautifulSoup
 
+# 自动加载同目录下的 .env 文件
+_env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+if os.path.exists(_env_file):
+    with open(_env_file) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _, _v = _line.partition("=")
+                os.environ.setdefault(_k.strip(), _v.strip())
+
 
 # ── 配置 ──────────────────────────────────────────────────────────────────────
 
-AI_BASE_URL  = "https://ark.cn-beijing.volces.com/api/coding"
-AI_API_KEY   = "1d3ace95-c577-4eee-ae9d-4fc85f3d07ee"
-AI_MODEL     = "doubao-seed-2.0-pro"
-LARK_CLI     = "/Users/chenjiawen/.hermes/node/bin/lark-cli"
+AI_BASE_URL  = os.environ.get("AI_BASE_URL",  "https://ark.cn-beijing.volces.com/api/coding")
+AI_API_KEY   = os.environ.get("AI_API_KEY",  "1d3ace95-c577-4eee-ae9d-4fc85f3d07ee")
+AI_MODEL     = os.environ.get("AI_MODEL",    "doubao-seed-2.0-pro")
+LARK_CLI     = os.environ.get("LARK_CLI",    "/Users/chenjiawen/.hermes/node/bin/lark-cli")
+
+# GitHub Personal Access Token（可选，有则速率从 60/h 提升到 5000/h）
+# 获取：github.com → Settings → Developer settings → Personal access tokens → Fine-grained
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 
 # 目标飞书知识库节点（所有子文档将挂在此节点下）
 # https://icanx2007.feishu.cn/wiki/YUXew6c5ci2FQbkrQzmc13axnTc
-WIKI_NODE_TOKEN = "YUXew6c5ci2FQbkrQzmc13axnTc"
+WIKI_NODE_TOKEN = os.environ.get("WIKI_NODE_TOKEN", "YUXew6c5ci2FQbkrQzmc13axnTc")
 
 # 输出目录 & 缓存文件
 OUTPUT_DIR   = os.path.expanduser("~/Downloads/trending_to_feishu")
@@ -109,6 +123,15 @@ def save_cache(cache: dict) -> None:
     print(f"✓ 缓存已更新：{CACHE_FILE}")
 
 
+# ── GitHub 请求头（带 Token 时速率限制从 60/h 提升到 5000/h）─────────────────
+
+def _github_headers() -> dict:
+    h = {"Accept": "application/vnd.github+json"}
+    if GITHUB_TOKEN:
+        h["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    return h
+
+
 # ── 抓取 GitHub Trending ───────────────────────────────────────────────────────
 
 def fetch_trending(since: str = "daily") -> list[dict]:
@@ -169,7 +192,7 @@ def fetch_trending(since: str = "daily") -> list[dict]:
 def fetch_dir(owner: str, repo: str, path: str) -> list[dict]:
     api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
     try:
-        resp = requests.get(api_url, timeout=15)
+        resp = requests.get(api_url, headers=_github_headers(), timeout=15)
         resp.raise_for_status()
     except Exception as e:
         print(f"  ⚠ GitHub API 失败：{e}")
@@ -212,7 +235,7 @@ def fetch_repo_content(github_url: str) -> tuple[str, str]:
             break
         print(f"  读取：{f['path']}")
         try:
-            r    = requests.get(f["download_url"], timeout=15)
+            r    = requests.get(f["download_url"], headers=_github_headers(), timeout=15)
             r.raise_for_status()
             ext  = os.path.splitext(f["name"])[1]
             chunk = f"\n\n---\n## 文件：{f['path']}\n\n```{ext.lstrip('.')}\n{r.text}\n```"

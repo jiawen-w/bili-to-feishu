@@ -12,14 +12,33 @@ import sys
 import subprocess
 import requests
 
+# 自动加载同目录下的 .env 文件
+_env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+if os.path.exists(_env_file):
+    with open(_env_file) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _, _v = _line.partition("=")
+                os.environ.setdefault(_k.strip(), _v.strip())
+
 
 # ── 配置（与 bili_to_feishu.py 相同）─────────────────────────────────────────
 
-AI_BASE_URL = "https://ark.cn-beijing.volces.com/api/coding"
-AI_API_KEY  = "1d3ace95-c577-4eee-ae9d-4fc85f3d07ee"
-AI_MODEL    = "doubao-seed-2.0-pro"
+AI_BASE_URL  = os.environ.get("AI_BASE_URL",  "https://ark.cn-beijing.volces.com/api/coding")
+AI_API_KEY   = os.environ.get("AI_API_KEY",  "1d3ace95-c577-4eee-ae9d-4fc85f3d07ee")
+AI_MODEL     = os.environ.get("AI_MODEL",    "doubao-seed-2.0-pro")
+LARK_CLI     = os.environ.get("LARK_CLI",    "/Users/chenjiawen/.hermes/node/bin/lark-cli")
 
-LARK_CLI    = "/Users/chenjiawen/.hermes/node/bin/lark-cli"
+# GitHub Token（可选，无 token 每小时限 60 次，有则 5000 次）
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+
+
+def _github_headers() -> dict:
+    h = {"Accept": "application/vnd.github+json"}
+    if GITHUB_TOKEN:
+        h["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    return h
 
 # 抓取这些扩展名的文件
 INCLUDE_EXTS = {".md", ".py", ".js", ".ts", ".json", ".yaml", ".yml", ".toml", ".txt", ".sh"}
@@ -77,7 +96,7 @@ def parse_github_url(url: str) -> tuple[str, str, str]:
 def fetch_dir(owner: str, repo: str, path: str, depth: int = 0) -> list[dict]:
     """递归获取目录下所有文件信息"""
     api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
-    resp = requests.get(api_url, timeout=15)
+    resp = requests.get(api_url, headers=_github_headers(), timeout=15)
     resp.raise_for_status()
     items = resp.json()
 
@@ -96,7 +115,7 @@ def fetch_dir(owner: str, repo: str, path: str, depth: int = 0) -> list[dict]:
 
 
 def fetch_file_content(download_url: str) -> str:
-    resp = requests.get(download_url, timeout=15)
+    resp = requests.get(download_url, headers=_github_headers(), timeout=15)
     resp.raise_for_status()
     return resp.text
 
