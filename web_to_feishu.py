@@ -8,9 +8,12 @@
     playwright install chromium
 """
 
+from __future__ import annotations
+
 import os
 import re
 import sys
+import json
 import subprocess
 import mimetypes
 import requests
@@ -323,17 +326,192 @@ def run(url: str, upload_feishu: bool = True, save_md: bool = True,
     print("\n✅ 完成！")
 
 
+# ── 多链接批量流程 ─────────────────────────────────────────────────────────────
+
+def run_batch(
+    urls:          list[str],
+    upload_feishu: bool = True,
+    save_md:       bool = True,
+    output_dir:    str  = "~/Downloads/web_to_feishu",
+) -> None:
+    """按顺序处理多个链接，最后汇总输出所有飞书链接"""
+
+    # 记录每条链接的处理结果
+    results = []   # {"url", "title", "doc_url", "ok", "error"}
+
+    for i, url in enumerate(urls, 1):
+        print(f"\n{'═'*55}")
+        print(f"  [{i}/{len(urls)}]  {url}")
+        print(f"{'═'*55}")
+        try:
+            doc_url = _run_single(
+                url          = url,
+                upload_feishu= upload_feishu,
+                save_md      = save_md,
+                output_dir   = output_dir,
+            )
+            results.append({"url": url, "doc_url": doc_url, "ok": True, "title": "", "error": ""})
+        except Exception as e:
+            import traceback
+            print(f"✗ 处理失败：{e}")
+            traceback.print_exc()
+            results.append({"url": url, "doc_url": "", "ok": False, "title": "", "error": str(e)})
+
+    # ── 汇总 ──────────────────────────────────────────────────────────────────
+    ok_list   = [r for r in results if r["ok"]]
+    fail_list = [r for r in results if not r["ok"]]
+
+    print(f"\n{'═'*55}")
+    print(f"  全部完成！成功 {len(ok_list)}/{len(results)}  失败 {len(fail_list)}/{len(results)}")
+    print(f"{'═'*55}")
+
+    if ok_list:
+        print("\n✅ 已写入飞书：")
+        for r in ok_list:
+            link = r["doc_url"] or "（无链接）"
+            short_url = r["url"][:60] + "…" if len(r["url"]) > 60 else r["url"]
+            print(f"  • {short_url}")
+            print(f"    🔗 {link}")
+
+    if fail_list:
+        print("\n❌ 失败：")
+        for r in fail_list:
+            print(f"  • {r['url']}")
+            print(f"    原因：{r['error']}")
+
+
+def _run_single(
+    url:           str,
+    upload_feishu: bool = True,
+    save_md:       bool = True,
+    output_dir:    str  = "~/Downloads/web_to_feishu",
+) -> str:
+    """
+    处理单条链接，返回飞书文档 URL。
+    原 run() 逻辑完全不变，只是把 doc_url 作为返回值透传出来。
+    """
+    ensure_package("requests")
+    ensure_package("beautifulsoup4", "bs4")
+    ensure_package("markdownify")
+    ensure_package("browser-cookie3", "browser_cookie3")
+
+    output_dir = os.path.expanduser(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+
+    print(f"[1/3] 抓取网页 …\n  {url}")
+    platform = detect_platform(url)
+    print(f"  平台识别：{platform}")
+
+    if platform in PLAYWRIGHT_REQUIRED:
+        ensure_package("playwright")
+        html    = fetch_html_playwright(url)
+        cookies = {}
+    else:
+        cookies = {}
+        if platform in COOKIE_REQUIRED:
+            domain = re.search(r"([\w-]+\.[\w]+)(?:/|$)", url.split("//")[-1])
+            if domain:
+                print(f"  正在读取 Chrome Cookie（{domain.group(1)}）…")
+                cookies = get_browser_cookies(domain.group(1))
+        resp = requests.get(url, headers=HEADERS, cookies=cookies, timeout=15)
+        resp.raise_for_status()
+        resp.encoding = resp.apparent_encoding
+        html = resp.text
+
+    print("[2/3] 提取正文 + 处理图片 …")
+    safe_prefix = re.sub(r"[^\w]", "_", urlparse(url).path.split("/")[-1])[:30] or "article"
+    img_dir     = os.path.join(output_dir, f"{safe_prefix}_images")
+
+    title, md_content = extract_content(html, platform, url, img_dir, cookies)
+    print(f"  标题：{title}")
+    print(f"  正文：{len(md_content)} 字符")
+
+    if save_md:
+        safe_title = re.sub(r'[\\/:*?"<>|]', "_", title)[:80]
+        md_path = os.path.join(output_dir, f"{safe_title}.md")
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write(f"# {title}\n\n{md_content}\n\n---\n\n> 来源：{url}")
+        print(f"  已保存：{md_path}")
+
+    doc_url = ""
+    if upload_feishu:
+        print("[3/3] 写入飞书 …")
+        doc_url = _upload_and_return(
+            title   = title,
+            content = f"# {title}\n\n{md_content}\n\n---\n\n> 来源：{url}",
+        )
+
+    print("✅ 完成！")
+    return doc_url
+
+
+def _upload_and_return(title: str, content: str) -> str:
+    """调用 upload_to_feishu 并返回文档 URL"""
+    result = subprocess.run(
+        [LARK_CLI, "docs", "+create",
+         "--api-version", "v2",
+         "--title", title,
+         "--content", content,
+         "--doc-format", "markdown"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(f"\n✗ 飞书写入失败：{result.stderr.strip()}")
+        return ""
+    try:
+        data    = json.loads(result.stdout)
+        doc_url = data.get("data", {}).get("document", {}).get("url", "")
+        if doc_url:
+            print(f"  ✓ 飞书文档已创建：{doc_url}")
+        return doc_url
+    except Exception:
+        print(f"  ✓ 飞书文档已创建\n{result.stdout.strip()}")
+        return ""
+
+
+def _collect_urls() -> list[str]:
+    """收集多个链接：命令行参数 或 交互式逐行输入（空行结束）"""
+    # 命令行传入
+    cli_urls = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if cli_urls:
+        print(f"共 {len(cli_urls)} 个链接（来自命令行参数）")
+        return cli_urls
+
+    # 交互式输入
+    print("请输入网页链接，每行一个，输入空行开始处理：")
+    urls = []
+    while True:
+        try:
+            line = input("  > ").strip()
+        except EOFError:
+            break
+        if not line:
+            if urls:
+                break
+            continue
+        # 支持直接粘贴多个链接（空格/换行分隔）
+        for part in line.split():
+            if part.startswith("http"):
+                urls.append(part)
+    return urls
+
+
 # ── 入口 ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        target_url = sys.argv[1]
-    else:
-        target_url = input("请输入网页链接：").strip()
+    no_feishu = "--no-feishu" in sys.argv
+    no_save   = "--no-save"   in sys.argv
 
-    run(
-        url=target_url,
-        upload_feishu=True,
-        save_md=True,
-        output_dir="~/Downloads/web_to_feishu",
+    urls = _collect_urls()
+    if not urls:
+        print("未输入任何链接，退出。")
+        sys.exit(0)
+
+    print(f"\n共 {len(urls)} 个链接，开始按顺序处理 …\n")
+
+    run_batch(
+        urls          = urls,
+        upload_feishu = not no_feishu,
+        save_md       = not no_save,
+        output_dir    = "~/Downloads/web_to_feishu",
     )
