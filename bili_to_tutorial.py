@@ -153,33 +153,30 @@ def ai_text(prompt: str, fast: bool = False, max_tokens: int = 4096) -> str:
     return msg.content[0].text
 
 
-def ai_vision(image_path: str, prompt: str, max_tokens: int = 2048) -> str:
-    """发送图片 + 文字给视觉模型"""
-    client, model = ai_client(fast=False)
-    with open(image_path, "rb") as f:
-        img_b64 = base64.standard_b64encode(f.read()).decode()
+def ai_vision(image_paths: "str | list[str]", prompt: str, max_tokens: int = 2048) -> str:
+    """发送一张或多张图片 + 文字给视觉模型"""
+    if isinstance(image_paths, str):
+        image_paths = [image_paths]
 
-    ext = Path(image_path).suffix.lower()
-    media_type = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
-                  "png": "image/png", "webp": "image/webp"}.get(ext.lstrip("."), "image/jpeg")
+    client, model = ai_client(fast=False)
+
+    content: list = []
+    for image_path in image_paths:
+        with open(image_path, "rb") as f:
+            img_b64 = base64.standard_b64encode(f.read()).decode()
+        ext = Path(image_path).suffix.lower()
+        media_type = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
+                      "png": "image/png", "webp": "image/webp"}.get(ext.lstrip("."), "image/jpeg")
+        content.append({
+            "type": "image",
+            "source": {"type": "base64", "media_type": media_type, "data": img_b64},
+        })
+    content.append({"type": "text", "text": prompt})
 
     msg = client.messages.create(
         model=model,
         max_tokens=max_tokens,
-        messages=[{
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": media_type,
-                        "data": img_b64,
-                    }
-                },
-                {"type": "text", "text": prompt}
-            ]
-        }],
+        messages=[{"role": "user", "content": content}],
     )
     return msg.content[0].text
 
@@ -319,51 +316,84 @@ def extract_frame(video_path: str, timestamp_sec: float, output_path: str) -> bo
     return result.returncode == 0 and os.path.exists(output_path)
 
 
-def pick_best_frame(video_path: str, ts: float, frames_dir: str, idx: int) -> str | None:
+def pick_best_frames(video_path: str, ts: float, frames_dir: str, idx: int,
+                     max_count: int = 2) -> list:
     """
-    在 ts 附近取几帧，选文件最大的（往往内容最丰富）
-    返回最终选中帧的路径
+    在知识点时间戳附近扫描多帧，返回最多 max_count 张最优帧路径列表。
+
+    扫描策略：
+    - 向后扫 0~8 秒（标题/字幕通常在讲解开始后几秒才出现）
+    - 适当向前扫 1~2 秒（有些片头在转场前）
+    - 文件大小作为"画面内容丰富度"的代理指标
+    - 两帧之间时间间隔 >= 2 秒，避免重复相似帧
     """
+    offsets = [0, 1, 2, 3, 4, 5, 6, 7, 8, -1, -2]
     candidates = []
-    offsets = [0, -1, 1, -2, 2]   # 优先精确时间，再往前后微调
     for offset in offsets:
         t = max(0, ts + offset)
-        path = os.path.join(frames_dir, f"_candidate_{idx}_{offset}.jpg")
+        path = os.path.join(frames_dir, f"_cand_{idx}_{offset:+d}.jpg")
         if extract_frame(video_path, t, path):
             size = os.path.getsize(path)
-            candidates.append((size, path))
+            candidates.append((size, float(t), path))
 
     if not candidates:
-        return None
+        return []
 
+    # 按内容丰富度降序
     candidates.sort(reverse=True)
-    best_path = candidates[0][1]
 
-    # 重命名为正式帧
-    final_path = os.path.join(frames_dir, f"frame_{idx:02d}.jpg")
-    os.rename(best_path, final_path)
+    # 选出时间间隔 >= 2s 的前 max_count 帧
+    selected: list[tuple] = []
+    for size, t, path in candidates:
+        if all(abs(t - st) >= 2.0 for _, st, _ in selected):
+            selected.append((size, t, path))
+            if len(selected) >= max_count:
+                break
 
-    # 清理其他候选
-    for _, p in candidates[1:]:
-        try:
-            os.remove(p)
-        except OSError:
-            pass
+    # 按时间顺序排列，视觉更自然
+    selected.sort(key=lambda x: x[1])
 
-    return final_path
+    # 重命名为正式帧（frame_01a.jpg, frame_01b.jpg …）
+    final_paths = []
+    used_paths = set()
+    for sub_idx, (_, _, path) in enumerate(selected):
+        suffix = chr(ord("a") + sub_idx)
+        final_path = os.path.join(frames_dir, f"frame_{idx:02d}{suffix}.jpg")
+        os.rename(path, final_path)
+        final_paths.append(final_path)
+        used_paths.add(path)
+
+    # 清理所有未用候选
+    for _, _, path in candidates:
+        if path not in used_paths:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    return final_paths
 
 
 # ── Step 6: AI 视觉生成笔记 ─────────────────────────────────────────────────────
 
-def generate_note(frame_path: str, kp: dict, segments: list) -> str:
+def generate_note(frame_paths: list, kp: dict, segments: list) -> str:
+    """
+    frame_paths: 该知识点对应的截图列表（1~2 张）
+    同时把所有截图发给视觉模型，让 AI 综合画面内容生成笔记。
+    """
     ctx = get_context_around(segments, kp["timestamp_sec"], window=25.0)
+    n_shots = len(frame_paths)
+    shot_desc = "一张截图" if n_shots == 1 else f"{n_shots} 张截图（按时间先后顺序）"
     prompt = VISION_NOTE_PROMPT.format(
         title=kp["title"],
         timestamp=format_hms(kp["timestamp_sec"]),
         subtitle_context=ctx or "（该时段无字幕）",
+    ).replace(
+        "我给你一张视频截图",
+        f"我给你 {shot_desc}",
     )
     try:
-        note = ai_vision(frame_path, prompt)
+        note = ai_vision(frame_paths, prompt)
     except Exception as e:
         # 视觉调用失败则降级为纯文本
         print(f"  ⚠ 视觉分析失败（{e}），改用文本模式")
@@ -379,10 +409,10 @@ def generate_note(frame_path: str, kp: dict, segments: list) -> str:
 def generate_tutorial(
     title: str,
     url: str,
-    keypoints: list[dict],
-    notes: list[str],
+    keypoints: list,
+    notes: list,
     frames_dir: str,
-    frame_paths: list[str | None],
+    frame_paths: list,          # list[list[str]]，每个知识点对应 1~2 张帧路径
     output_path: str,
     overview: str = "",
 ) -> None:
@@ -400,16 +430,21 @@ def generate_tutorial(
 
     # 正文
     sections = []
-    for i, (kp, note, frame_path) in enumerate(zip(keypoints, notes, frame_paths), 1):
-        img_rel = os.path.relpath(frame_path, os.path.dirname(output_path)) if frame_path else None
-        img_md  = f"![{kp['title']}]({img_rel})" if img_rel else "*（截帧失败）*"
+    for i, (kp, note, fps) in enumerate(zip(keypoints, notes, frame_paths), 1):
+        # fps 是该知识点对应的帧路径列表（1~2 张），也可能为空列表
+        if fps:
+            imgs_md = "\n\n".join(
+                f"![{kp['title']}截图{chr(ord('A') + j)}]"
+                f"({os.path.relpath(fp, os.path.dirname(output_path))})"
+                for j, fp in enumerate(fps)
+            )
+        else:
+            imgs_md = "*（截帧失败）*"
 
-        # 不用 textwrap.dedent —— note 是多行 AI 输出，含无缩进行时会导致
-        # dedent 计算公共缩进为 0，使标题/时间戳前留下多余空格
         section = (
             f"## {i}. {kp['title']}\n\n"
             f"**时间戳：** [{format_hms(kp['timestamp_sec'])}]({url}&t={kp['timestamp_sec']})\n\n"
-            f"{img_md}\n\n"
+            f"{imgs_md}\n\n"
             f"{note.strip()}\n\n"
             f"---\n"
         )
@@ -474,14 +509,35 @@ class Cache:
                 return json.load(f)
         return None
 
-    def frames(self) -> list[str]:
+    def frames(self) -> list:
+        """
+        返回每个知识点对应的帧路径列表，形如 [[frame_01a.jpg, frame_01b.jpg], [frame_02a.jpg], ...]
+        兼容旧格式 frame_01.jpg（视为单帧）
+        """
         if not os.path.isdir(self.frames_dir):
             return []
-        return sorted(
-            [os.path.join(self.frames_dir, f)
-             for f in os.listdir(self.frames_dir)
-             if re.match(r"frame_\d+\.jpg", f)]
-        )
+        groups: dict[int, list[str]] = {}
+        for fname in os.listdir(self.frames_dir):
+            # 新格式: frame_01a.jpg / frame_01b.jpg
+            m = re.match(r"frame_(\d+)([a-z])\.jpg", fname)
+            if m:
+                num = int(m.group(1))
+                groups.setdefault(num, []).append(
+                    os.path.join(self.frames_dir, fname)
+                )
+                continue
+            # 旧格式兼容: frame_01.jpg
+            m2 = re.match(r"frame_(\d+)\.jpg", fname)
+            if m2:
+                num = int(m2.group(1))
+                groups.setdefault(num, []).append(
+                    os.path.join(self.frames_dir, fname)
+                )
+        # 每组内按文件名排序保证 a < b
+        result = []
+        for k in sorted(groups.keys()):
+            result.append(sorted(groups[k]))
+        return result
 
     def notes(self) -> list | None:
         p = os.path.join(self.work_dir, "notes.json")
@@ -649,20 +705,24 @@ def run(
         keypoints = analyze_keypoints(title, segments)
         save_json(keypoints, os.path.join(work_dir, "keypoints.json"))
 
-    # ── 截帧（已有帧且数量匹配则跳过）
+    # ── 截帧（已有帧且分组数量匹配则跳过）
     cached_frames = cache.frames()
     if cached_frames and len(cached_frames) == len(keypoints):
-        print(f"\n[6/7] 跳过截帧（缓存命中）：{len(cached_frames)} 帧")
+        total_cached = sum(len(fps) for fps in cached_frames)
+        print(f"\n[6/7] 跳过截帧（缓存命中）：{len(cached_frames)} 个知识点 / {total_cached} 张帧")
         frame_paths = cached_frames
     else:
-        print("\n[6/7] 截取关键帧 …")
+        print("\n[6/7] 截取关键帧（每个知识点最多 2 张）…")
         frame_paths = []
         for i, kp in enumerate(keypoints, 1):
             ts = kp["timestamp_sec"]
             print(f"  [{i}/{len(keypoints)}] {format_hms(ts)} — {kp['title']}")
-            fp = pick_best_frame(video_path, ts, frames_dir, i)
-            frame_paths.append(fp)
-            print(f"    {'✓ ' + os.path.basename(fp) if fp else '✗ 截帧失败'}")
+            fps = pick_best_frames(video_path, ts, frames_dir, i, max_count=2)
+            frame_paths.append(fps)
+            if fps:
+                print(f"    ✓ {', '.join(os.path.basename(fp) for fp in fps)}")
+            else:
+                print(f"    ✗ 截帧失败")
 
     # ── AI 笔记生成（有缓存则跳过）
     cached_notes = cache.notes()
@@ -672,9 +732,9 @@ def run(
     else:
         print("\n[7/7] AI 生成每个知识点的笔记 …")
         notes = []
-        for i, (kp, fp) in enumerate(zip(keypoints, frame_paths), 1):
+        for i, (kp, fps) in enumerate(zip(keypoints, frame_paths), 1):
             print(f"  [{i}/{len(keypoints)}] {kp['title']} …")
-            note = generate_note(fp, kp, segments) if fp else ai_text(
+            note = generate_note(fps, kp, segments) if fps else ai_text(
                 f"知识点：{kp['title']}\n字幕：{get_context_around(segments, kp['timestamp_sec'])}\n生成学习笔记",
             )
             notes.append(note)
